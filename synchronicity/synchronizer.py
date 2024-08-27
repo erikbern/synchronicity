@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import collections.abc
+import concurrent.futures
 import contextlib
 import functools
 import inspect
@@ -18,7 +19,7 @@ from synchronicity.combined_types import FunctionWithAio, MethodWithAio
 
 from .async_wrap import wraps_by_interface
 from .callback import Callback
-from .exceptions import UserCodeException, unwrap_coro_exception, wrap_coro_exception
+from .exceptions import SynchronizerShutdown, UserCodeException, unwrap_coro_exception, wrap_coro_exception
 from .interface import Interface
 
 _BUILTIN_ASYNC_METHODS = {
@@ -100,6 +101,8 @@ def should_have_aio_interface(func):
 
 class Synchronizer:
     """Helps you offer a blocking (synchronous) interface to asynchronous code."""
+
+    _stopping: asyncio.Event
 
     def __init__(
         self,
@@ -310,7 +313,15 @@ class Synchronizer:
         coro = self._wrap_check_async_leakage(coro)
         loop = self._get_loop(start=True)
         fut = asyncio.run_coroutine_threadsafe(coro, loop)
-        value = fut.result()
+        try:
+            value = fut.result()
+        except concurrent.futures.CancelledError:
+            if not self._loop or self._stopping.is_set():
+                # this allows differentiate between wrapped code raising concurrent.futures.CancelledError
+                # and synchronicity itself raising it due to the event loop shutting down while waiting
+                # for the synchronizer.
+                raise SynchronizerShutdown()
+            raise
 
         if getattr(original_func, self._output_translation_attr, True):
             return self._translate_out(value, interface)
@@ -329,12 +340,18 @@ class Synchronizer:
         coro = wrap_coro_exception(coro)
         coro = self._wrap_check_async_leakage(coro)
         loop = self._get_loop(start=True)
+
         if self._is_inside_loop():
             value = await coro
         else:
-            c_fut = asyncio.run_coroutine_threadsafe(coro, loop)
-            a_fut = asyncio.wrap_future(c_fut)
-            value = await a_fut
+            try:
+                c_fut = asyncio.run_coroutine_threadsafe(coro, loop)
+                a_fut = asyncio.wrap_future(c_fut)
+                value = await a_fut
+            except asyncio.CancelledError:
+                if not self._loop or self._stopping.is_set():
+                    raise SynchronizerShutdown()
+                raise
 
         if getattr(original_func, self._output_translation_attr, True):
             return self._translate_out(value, interface)

@@ -1,6 +1,10 @@
 import asyncio
 
 
+class SynchronizerShutdown(Exception):
+    pass
+
+
 class UserCodeException(Exception):
     """This is used to wrap and unwrap exceptions in "user code".
 
